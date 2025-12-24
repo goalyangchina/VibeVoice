@@ -3,21 +3,16 @@ VibeVoice Gradio Demo - High-Quality Dialogue Generation Interface with Streamin
 """
 
 import argparse
-import json
+import importlib.util
 import os
-import sys
-import tempfile
 import time
-from pathlib import Path
-from typing import List, Dict, Any, Iterator
-from datetime import datetime
+from typing import Iterator
 import threading
 import numpy as np
 import gradio as gr
 import librosa
 import soundfile as sf
 import torch
-import os
 import traceback
 
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
@@ -40,13 +35,45 @@ class VibeVoiceDemo:
         self.is_generating = False  # Track generation state
         self.stop_generation = False  # Flag to stop generation
         self.current_streamer = None  # Track current audio streamer
+        if self.device.startswith("cuda") and not torch.cuda.is_available():
+            logger.warning("检测到设备设置为CUDA，但当前环境不可用，已自动切换为CPU。")
+            self.device = "cpu"
+        elif self.device == "auto" and not torch.cuda.is_available():
+            logger.warning("检测到 device=auto 但当前环境无可用GPU，已自动切换为CPU。")
+            self.device = "cpu"
+        self.torch_dtype = self._select_torch_dtype()
+        self.attn_implementation = self._select_attention_backend()
         self.load_model()
         self.setup_voice_presets()
         self.load_example_scripts()  # Load example scripts
+
+    def _select_torch_dtype(self):
+        """Select a dtype that works across GPU/CPU environments."""
+        try:
+            if self._using_cuda():
+                if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+                    return torch.bfloat16
+                return torch.float16
+        except Exception as exc:
+            logger.warning(f"自动选择dtype时出现警告，回退到float32: {exc}")
+        return torch.float32
+
+    def _select_attention_backend(self):
+        """Gracefully pick an attention backend based on availability."""
+        if self._using_cuda():
+            # Prefer flash attention when available for speed, otherwise use SDPA.
+            if importlib.util.find_spec("flash_attn") or importlib.util.find_spec("flash_attn_2"):
+                return "flash_attention_2"
+            return "sdpa"
+        return "eager"
+
+    def _using_cuda(self) -> bool:
+        """Check if CUDA is available and selected (including auto)."""
+        return (self.device == "auto" or self.device.startswith("cuda")) and torch.cuda.is_available()
         
     def load_model(self):
         """Load the VibeVoice model and processor."""
-        print(f"Loading processor & model from {self.model_path}")
+        print(f"加载处理器与模型：{self.model_path}")
         
         # Load processor
         self.processor = VibeVoiceProcessor.from_pretrained(
@@ -54,11 +81,17 @@ class VibeVoiceDemo:
         )
         
         # Load model
+        device_map = (
+            "auto"
+            if self.device == "auto" and self._using_cuda()
+            else self.device
+        )
+
         self.model = VibeVoiceForConditionalGenerationInference.from_pretrained(
             self.model_path,
-            torch_dtype=torch.bfloat16,
-            device_map='cuda',
-            attn_implementation="flash_attention_2",
+            torch_dtype=self.torch_dtype,
+            device_map=device_map,
+            attn_implementation=self.attn_implementation,
         )
         self.model.eval()
         
@@ -71,7 +104,7 @@ class VibeVoiceDemo:
         self.model.set_ddpm_inference_steps(num_steps=self.inference_steps)
         
         if hasattr(self.model.model, 'language_model'):
-            print(f"Language model attention: {self.model.model.language_model.config._attn_implementation}")
+            print(f"注意力实现：{self.model.model.language_model.config._attn_implementation}，精度：{self.torch_dtype}")
     
     def setup_voice_presets(self):
         """Setup voice presets by scanning the voices directory."""
@@ -79,7 +112,7 @@ class VibeVoiceDemo:
         
         # Check if voices directory exists
         if not os.path.exists(voices_dir):
-            print(f"Warning: Voices directory not found at {voices_dir}")
+            print(f"警告：未在 {voices_dir} 找到音色目录")
             self.voice_presets = {}
             self.available_voices = {}
             return
@@ -109,10 +142,10 @@ class VibeVoiceDemo:
         }
         
         if not self.available_voices:
-            raise gr.Error("No voice presets found. Please add .wav files to the demo/voices directory.")
+            raise gr.Error("未找到任何音色预设，请在 demo/voices 目录中添加 .wav 或常见音频文件。")
         
-        print(f"Found {len(self.available_voices)} voice files in {voices_dir}")
-        print(f"Available voices: {', '.join(self.available_voices.keys())}")
+        print(f"已在 {voices_dir} 发现 {len(self.available_voices)} 个音频文件")
+        print(f"可用音色：{', '.join(self.available_voices.keys())}")
     
     def read_audio(self, audio_path: str, target_sr: int = 24000) -> np.ndarray:
         """Read and preprocess audio file."""
@@ -124,7 +157,7 @@ class VibeVoiceDemo:
                 wav = librosa.resample(wav, orig_sr=sr, target_sr=target_sr)
             return wav
         except Exception as e:
-            print(f"Error reading audio {audio_path}: {e}")
+            print(f"读取音频 {audio_path} 时出错：{e}")
             return np.array([])
     
     def generate_podcast_streaming(self, 
@@ -144,14 +177,14 @@ class VibeVoiceDemo:
             # Validate inputs
             if not script.strip():
                 self.is_generating = False
-                raise gr.Error("Error: Please provide a script.")
+                raise gr.Error("错误：请输入对话脚本。")
 
             # Defend against common mistake
             script = script.replace("’", "'")
             
             if num_speakers < 1 or num_speakers > 4:
                 self.is_generating = False
-                raise gr.Error("Error: Number of speakers must be between 1 and 4.")
+                raise gr.Error("错误：说话人数量需在 1 到 4 之间。")
             
             # Collect selected speakers
             selected_speakers = [speaker_1, speaker_2, speaker_3, speaker_4][:num_speakers]
@@ -160,17 +193,17 @@ class VibeVoiceDemo:
             for i, speaker in enumerate(selected_speakers):
                 if not speaker or speaker not in self.available_voices:
                     self.is_generating = False
-                    raise gr.Error(f"Error: Please select a valid speaker for Speaker {i+1}.")
+                    raise gr.Error(f"错误：请为说话人 {i+1} 选择有效的声音。")
             
             # Build initial log
-            log = f"🎙️ Generating podcast with {num_speakers} speakers\n"
-            log += f"📊 Parameters: CFG Scale={cfg_scale}, Inference Steps={self.inference_steps}\n"
-            log += f"🎭 Speakers: {', '.join(selected_speakers)}\n"
+            log = f"🎙️ 正在生成包含 {num_speakers} 位说话人的播客\n"
+            log += f"📊 参数：CFG={cfg_scale}，推理步数={self.inference_steps}\n"
+            log += f"🎭 说话人：{', '.join(selected_speakers)}\n"
             
             # Check for stop signal
             if self.stop_generation:
                 self.is_generating = False
-                yield None, "🛑 Generation stopped by user", gr.update(visible=False)
+                yield None, "🛑 已按用户请求停止生成", gr.update(visible=False)
                 return
             
             # Load voice samples
@@ -180,7 +213,7 @@ class VibeVoiceDemo:
                 audio_data = self.read_audio(audio_path)
                 if len(audio_data) == 0:
                     self.is_generating = False
-                    raise gr.Error(f"Error: Failed to load audio for {speaker_name}")
+                    raise gr.Error(f"错误：无法读取 {speaker_name} 的音频示例。")
                 voice_samples.append(audio_data)
             
             # log += f"✅ Loaded {len(voice_samples)} voice samples\n"
@@ -188,7 +221,7 @@ class VibeVoiceDemo:
             # Check for stop signal
             if self.stop_generation:
                 self.is_generating = False
-                yield None, "🛑 Generation stopped by user", gr.update(visible=False)
+                yield None, "🛑 已按用户请求停止生成", gr.update(visible=False)
                 return
             
             # Parse script to assign speaker ID's
@@ -209,13 +242,13 @@ class VibeVoiceDemo:
                     formatted_script_lines.append(f"Speaker {speaker_id}: {line}")
             
             formatted_script = '\n'.join(formatted_script_lines)
-            log += f"📝 Formatted script with {len(formatted_script_lines)} turns\n\n"
-            log += "🔄 Processing with VibeVoice (streaming mode)...\n"
+            log += f"📝 已整理脚本，共 {len(formatted_script_lines)} 轮对话\n\n"
+            log += "🔄 VibeVoice 流式生成中...\n"
             
             # Check for stop signal before processing
             if self.stop_generation:
                 self.is_generating = False
-                yield None, "🛑 Generation stopped by user", gr.update(visible=False)
+                yield None, "🛑 已按用户请求停止生成", gr.update(visible=False)
                 return
             
             start_time = time.time()
@@ -253,7 +286,7 @@ class VibeVoiceDemo:
                 audio_streamer.end()
                 generation_thread.join(timeout=5.0)  # Wait up to 5 seconds for thread to finish
                 self.is_generating = False
-                yield None, "🛑 Generation stopped by user", gr.update(visible=False)
+                yield None, "🛑 已按用户请求停止生成", gr.update(visible=False)
                 return
 
             # Collect audio chunks as they arrive
@@ -323,7 +356,7 @@ class VibeVoiceDemo:
                     new_duration = len(new_audio) / sample_rate
                     total_duration = sum(len(chunk) for chunk in all_audio_chunks) / sample_rate
                     
-                    log_update = log + f"🎵 Streaming: {total_duration:.1f}s generated (chunk {chunk_count})\n"
+                    log_update = log + f"🎵 流式生成：已生成 {total_duration:.1f} 秒（第 {chunk_count} 块）\n"
                     
                     # Yield streaming audio chunk and keep complete_audio as None during streaming
                     yield (sample_rate, new_audio), None, log_update, gr.update(visible=True)
@@ -336,7 +369,7 @@ class VibeVoiceDemo:
             if pending_chunks:
                 final_new_audio = np.concatenate(pending_chunks)
                 total_duration = sum(len(chunk) for chunk in all_audio_chunks) / sample_rate
-                log_update = log + f"🎵 Streaming final chunk: {total_duration:.1f}s total\n"
+                log_update = log + f"🎵 最后一段流式输出：累计 {total_duration:.1f} 秒\n"
                 yield (sample_rate, final_new_audio), None, log_update, gr.update(visible=True)
                 has_yielded_audio = True  # Mark that we yielded audio
             
@@ -345,7 +378,7 @@ class VibeVoiceDemo:
 
             # If thread is still alive after timeout, force end
             if generation_thread.is_alive():
-                print("Warning: Generation thread did not complete within timeout")
+                print("警告：生成线程未在超时时间内结束，将强制停止流式输出")
                 audio_streamer.end()
                 generation_thread.join(timeout=5.0)
 
@@ -357,7 +390,7 @@ class VibeVoiceDemo:
             
             # Check if stopped by user
             if self.stop_generation:
-                yield None, None, "🛑 Generation stopped by user", gr.update(visible=False)
+                yield None, None, "🛑 已按用户请求停止生成", gr.update(visible=False)
                 return
             
             # Debug logging
@@ -369,23 +402,23 @@ class VibeVoiceDemo:
                 complete_audio = np.concatenate(all_audio_chunks)
                 final_duration = len(complete_audio) / sample_rate
                 
-                final_log = log + f"⏱️ Generation completed in {generation_time:.2f} seconds\n"
-                final_log += f"🎵 Final audio duration: {final_duration:.2f} seconds\n"
-                final_log += f"📊 Total chunks: {chunk_count}\n"
-                final_log += "✨ Generation successful! Complete audio is ready.\n"
-                final_log += "💡 Not satisfied? You can regenerate or adjust the CFG scale for different results."
+                final_log = log + f"⏱️ 生成完成，用时 {generation_time:.2f} 秒\n"
+                final_log += f"🎵 音频时长：{final_duration:.2f} 秒\n"
+                final_log += f"📊 音频块总数：{chunk_count}\n"
+                final_log += "✨ 生成成功！完整音频已准备就绪。\n"
+                final_log += "💡 想要更好的效果？尝试重新生成或调整 CFG 强度。"
                 
                 # Yield the complete audio
                 yield None, (sample_rate, complete_audio), final_log, gr.update(visible=False)
                 return
             
             if not has_received_chunks:
-                error_log = log + f"\n❌ Error: No audio chunks were received from the model. Generation time: {generation_time:.2f}s"
+                error_log = log + f"\n❌ 错误：模型未返回任何音频块。耗时 {generation_time:.2f} 秒"
                 yield None, None, error_log, gr.update(visible=False)
                 return
             
             if not has_yielded_audio:
-                error_log = log + f"\n❌ Error: Audio was generated but not streamed. Chunk count: {chunk_count}"
+                error_log = log + f"\n❌ 错误：音频已生成但未完成流式输出。音频块数量：{chunk_count}"
                 yield None, None, error_log, gr.update(visible=False)
                 return
 
@@ -394,30 +427,30 @@ class VibeVoiceDemo:
                 complete_audio = np.concatenate(all_audio_chunks)
                 final_duration = len(complete_audio) / sample_rate
                 
-                final_log = log + f"⏱️ Generation completed in {generation_time:.2f} seconds\n"
-                final_log += f"🎵 Final audio duration: {final_duration:.2f} seconds\n"
-                final_log += f"📊 Total chunks: {chunk_count}\n"
-                final_log += "✨ Generation successful! Complete audio is ready in the 'Complete Audio' tab.\n"
-                final_log += "💡 Not satisfied? You can regenerate or adjust the CFG scale for different results."
+                final_log = log + f"⏱️ 生成完成，用时 {generation_time:.2f} 秒\n"
+                final_log += f"🎵 音频时长：{final_duration:.2f} 秒\n"
+                final_log += f"📊 音频块总数：{chunk_count}\n"
+                final_log += "✨ 生成成功！完整音频已出现在下方的“完整音频”区域。\n"
+                final_log += "💡 想要更好的效果？尝试重新生成或调整 CFG 强度。"
                 
                 # Final yield: Clear streaming audio and provide complete audio
                 yield None, (sample_rate, complete_audio), final_log, gr.update(visible=False)
             else:
-                final_log = log + "❌ No audio was generated."
+                final_log = log + "❌ 未生成任何音频。"
                 yield None, None, final_log, gr.update(visible=False)
 
         except gr.Error as e:
             # Handle Gradio-specific errors (like input validation)
             self.is_generating = False
             self.current_streamer = None
-            error_msg = f"❌ Input Error: {str(e)}"
+            error_msg = f"❌ 输入错误：{str(e)}"
             print(error_msg)
             yield None, None, error_msg, gr.update(visible=False)
             
         except Exception as e:
             self.is_generating = False
             self.current_streamer = None
-            error_msg = f"❌ An unexpected error occurred: {str(e)}"
+            error_msg = f"❌ 出现未预期的错误：{str(e)}"
             print(error_msg)
             import traceback
             traceback.print_exc()
@@ -450,7 +483,7 @@ class VibeVoiceDemo:
             )
             
         except Exception as e:
-            print(f"Error in generation thread: {e}")
+            print(f"生成线程发生错误：{e}")
             traceback.print_exc()
             # Make sure to end the stream on error
             audio_streamer.end()
@@ -462,8 +495,8 @@ class VibeVoiceDemo:
             try:
                 self.current_streamer.end()
             except Exception as e:
-                print(f"Error stopping streamer: {e}")
-        print("🛑 Audio generation stop requested")
+                print(f"停止流式器时出错：{e}")
+        print("🛑 已收到停止生成的请求")
     
     def load_example_scripts(self):
         """Load example scripts from the text_examples directory."""
@@ -472,7 +505,7 @@ class VibeVoiceDemo:
         
         # Check if text_examples directory exists
         if not os.path.exists(examples_dir):
-            print(f"Warning: text_examples directory not found at {examples_dir}")
+            print(f"警告：未在 {examples_dir} 找到示例文本目录")
             return
         
         # Get all .txt files in the text_examples directory
@@ -509,7 +542,7 @@ class VibeVoiceDemo:
                 print(f"Loaded example: {txt_file} with {num_speakers} speakers")
                 
             except Exception as e:
-                print(f"Error loading example script {txt_file}: {e}")
+                print(f"加载示例脚本 {txt_file} 时出错：{e}")
         
         if self.example_scripts:
             print(f"Successfully loaded {len(self.example_scripts)} example scripts")
@@ -748,7 +781,7 @@ def create_demo_interface(demo_instance: VibeVoiceDemo):
     """
     
     with gr.Blocks(
-        title="VibeVoice - AI Podcast Generator",
+        title="VibeVoice - AI播客生成器",
         css=custom_css,
         theme=gr.themes.Soft(
             primary_hue="blue",
@@ -760,15 +793,15 @@ def create_demo_interface(demo_instance: VibeVoiceDemo):
         # Header
         gr.HTML("""
         <div class="main-header">
-            <h1>🎙️ Vibe Podcasting </h1>
-            <p>Generating Long-form Multi-speaker AI Podcast with VibeVoice</p>
+            <h1>🎙️ Vibe 播客工坊</h1>
+            <p>用 VibeVoice 生成多说话人、长时长的 AI 播客</p>
         </div>
         """)
         
         with gr.Row():
             # Left column - Settings
             with gr.Column(scale=1, elem_classes="settings-card"):
-                gr.Markdown("### 🎛️ **Podcast Settings**")
+                gr.Markdown("### 🎛️ **播客设置**")
                 
                 # Number of speakers
                 num_speakers = gr.Slider(
@@ -776,12 +809,12 @@ def create_demo_interface(demo_instance: VibeVoiceDemo):
                     maximum=4,
                     value=2,
                     step=1,
-                    label="Number of Speakers",
+                    label="说话人数量",
                     elem_classes="slider-container"
                 )
                 
                 # Speaker selection
-                gr.Markdown("### 🎭 **Speaker Selection**")
+                gr.Markdown("### 🎭 **选择说话人**")
                 
                 available_speaker_names = list(demo_instance.available_voices.keys())
                 # default_speakers = available_speaker_names[:4] if len(available_speaker_names) >= 4 else available_speaker_names
@@ -793,39 +826,39 @@ def create_demo_interface(demo_instance: VibeVoiceDemo):
                     speaker = gr.Dropdown(
                         choices=available_speaker_names,
                         value=default_value,
-                        label=f"Speaker {i+1}",
+                        label=f"说话人 {i+1}",
                         visible=(i < 2),  # Initially show only first 2 speakers
                         elem_classes="speaker-item"
                     )
                     speaker_selections.append(speaker)
                 
                 # Advanced settings
-                gr.Markdown("### ⚙️ **Advanced Settings**")
+                gr.Markdown("### ⚙️ **高级设置**")
                 
                 # Sampling parameters (contains all generation settings)
-                with gr.Accordion("Generation Parameters", open=False):
+                with gr.Accordion("生成参数", open=False):
                     cfg_scale = gr.Slider(
                         minimum=1.0,
                         maximum=2.0,
                         value=1.3,
                         step=0.05,
-                        label="CFG Scale (Guidance Strength)",
+                        label="CFG 强度（文本约束）",
                         # info="Higher values increase adherence to text",
                         elem_classes="slider-container"
                     )
                 
             # Right column - Generation
             with gr.Column(scale=2, elem_classes="generation-card"):
-                gr.Markdown("### 📝 **Script Input**")
+                gr.Markdown("### 📝 **输入脚本**")
                 
                 script_input = gr.Textbox(
-                    label="Conversation Script",
-                    placeholder="""Enter your podcast script here. You can format it as:
+                    label="对话脚本",
+                    placeholder="""在此输入对话或旁白脚本，格式可参考：
 
-Speaker 0: Welcome to our podcast today!
-Speaker 1: Thanks for having me. I'm excited to discuss...
+Speaker 0: 欢迎来到今天的播客！
+Speaker 1: 感谢邀请，我很期待讨论...
 
-Or paste text directly and it will auto-assign speakers.""",
+也可以直接粘贴文本，系统会自动轮流分配说话人。""",
                     lines=12,
                     max_lines=20,
                     elem_classes="script-input"
@@ -835,7 +868,7 @@ Or paste text directly and it will auto-assign speakers.""",
                 with gr.Row():
                     # Random example button (now on the left)
                     random_example_btn = gr.Button(
-                        "🎲 Random Example",
+                        "🎲 随机示例",
                         size="lg",
                         variant="secondary",
                         elem_classes="random-btn",
@@ -844,7 +877,7 @@ Or paste text directly and it will auto-assign speakers.""",
                     
                     # Generate button (now on the right)
                     generate_btn = gr.Button(
-                        "🚀 Generate Podcast",
+                        "🚀 生成播客",
                         size="lg",
                         variant="primary",
                         elem_classes="generate-btn",
@@ -853,7 +886,7 @@ Or paste text directly and it will auto-assign speakers.""",
                 
                 # Stop button
                 stop_btn = gr.Button(
-                    "🛑 Stop Generation",
+                    "🛑 停止生成",
                     size="lg",
                     variant="stop",
                     elem_classes="stop-btn",
@@ -872,7 +905,7 @@ Or paste text directly and it will auto-assign speakers.""",
                                 font-size: 0.9rem;
                                 color: #166534;">
                         <span class="streaming-indicator"></span>
-                        <strong>LIVE STREAMING</strong> - Audio is being generated in real-time
+                        <strong>实时流式</strong> - 正在实时生成并播放音频
                     </div>
                     """,
                     visible=False,
@@ -880,11 +913,11 @@ Or paste text directly and it will auto-assign speakers.""",
                 )
                 
                 # Output section
-                gr.Markdown("### 🎵 **Generated Podcast**")
+                gr.Markdown("### 🎵 **生成结果**")
                 
                 # Streaming audio output (outside of tabs for simpler handling)
                 audio_output = gr.Audio(
-                    label="Streaming Audio (Real-time)",
+                    label="实时流式音频",
                     type="numpy",
                     elem_classes="audio-output",
                     streaming=True,  # Enable streaming mode
@@ -895,7 +928,7 @@ Or paste text directly and it will auto-assign speakers.""",
                 
                 # Complete audio output (non-streaming)
                 complete_audio_output = gr.Audio(
-                    label="Complete Podcast (Download after generation)",
+                    label="完整播客（生成后可下载）",
                     type="numpy",
                     elem_classes="audio-output complete-audio-section",
                     streaming=False,  # Non-streaming mode
@@ -905,13 +938,13 @@ Or paste text directly and it will auto-assign speakers.""",
                 )
                 
                 gr.Markdown("""
-                *💡 **Streaming**: Audio plays as it's being generated (may have slight pauses)  
-                *💡 **Complete Audio**: Will appear below after generation finishes*
+                *💡 **流式播放**：生成过程中实时播放，可能偶有停顿  
+                *💡 **完整音频**：生成完成后会在下方展示并支持下载*
                 """)
                 
                 # Generation log
                 log_output = gr.Textbox(
-                    label="Generation Log",
+                    label="生成日志",
                     lines=8,
                     max_lines=15,
                     interactive=False,
@@ -939,10 +972,10 @@ Or paste text directly and it will auto-assign speakers.""",
                 cfg_scale = speakers_and_params[4]   # CFG scale
                 
                 # Clear outputs and reset visibility at start
-                yield None, gr.update(value=None, visible=False), "🎙️ Starting generation...", gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)
+                yield None, gr.update(value=None, visible=False), "🎙️ 开始生成...", gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)
                 
                 # The generator will yield multiple times
-                final_log = "Starting generation..."
+                final_log = "开始生成..."
                 
                 for streaming_audio, complete_audio, log, streaming_visible in demo_instance.generate_podcast_streaming(
                     num_speakers=int(num_speakers),
@@ -968,7 +1001,7 @@ Or paste text directly and it will auto-assign speakers.""",
                             yield None, gr.update(visible=False), log, streaming_visible, gr.update(visible=False), gr.update(visible=True)
 
             except Exception as e:
-                error_msg = f"❌ A critical error occurred in the wrapper: {str(e)}"
+                error_msg = f"❌ 封装器发生严重错误：{str(e)}"
                 print(error_msg)
                 import traceback
                 traceback.print_exc()
@@ -979,7 +1012,7 @@ Or paste text directly and it will auto-assign speakers.""",
             """Handle stopping generation."""
             demo_instance.stop_audio_generation()
             # Return values for: log_output, streaming_status, generate_btn, stop_btn
-            return "🛑 Generation stopped.", gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
+            return "🛑 已停止生成。", gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
         
         # Add a clear audio function
         def clear_audio_outputs():
@@ -1024,7 +1057,7 @@ Or paste text directly and it will auto-assign speakers.""",
             else:
                 # Fallback to default
                 example_scripts = [
-                    [2, "Speaker 0: Welcome to our AI podcast demonstration!\nSpeaker 1: Thanks for having me. This is exciting!"]
+                    [2, "Speaker 0: 欢迎体验我们的 AI 播客生成！\nSpeaker 1: 很高兴来到这里，一起聊聊精彩话题。"]
                 ]
             
             # Randomly select one
@@ -1049,17 +1082,17 @@ Or paste text directly and it will auto-assign speakers.""",
         
         # Add usage tips
         gr.Markdown("""
-        ### 💡 **Usage Tips**
+        ### 💡 **使用小贴士**
         
-        - Click **🚀 Generate Podcast** to start audio generation
-        - **Live Streaming** tab shows audio as it's generated (may have slight pauses)
-        - **Complete Audio** tab provides the full, uninterrupted podcast after generation
-        - During generation, you can click **🛑 Stop Generation** to interrupt the process
-        - The streaming indicator shows real-time generation progress
+        - 点击 **🚀 生成播客** 开始生成音频
+        - **实时流式** 会在生成过程中持续播放（可能会有短暂停顿）
+        - **完整音频** 会在生成结束后显示可下载的成品
+        - 生成过程中可随时点击 **🛑 停止生成** 终止任务
+        - 顶部绿色指示灯会实时反馈生成状态
         """)
         
         # Add example scripts
-        gr.Markdown("### 📚 **Example Scripts**")
+        gr.Markdown("### 📚 **示例脚本**")
         
         # Use dynamically loaded examples if available, otherwise provide a default
         if hasattr(demo_instance, 'example_scripts') and demo_instance.example_scripts:
@@ -1067,13 +1100,13 @@ Or paste text directly and it will auto-assign speakers.""",
         else:
             # Fallback to a simple default example if no scripts loaded
             example_scripts = [
-                [1, "Speaker 1: Welcome to our AI podcast demonstration! This is a sample script showing how VibeVoice can generate natural-sounding speech."]
+                [1, "Speaker 1: 欢迎体验 VibeVoice AI 播客！这是一段展示自然语音合成效果的示例。"]
             ]
         
         gr.Examples(
             examples=example_scripts,
             inputs=[num_speakers, script_input],
-            label="Try these example scripts:"
+            label="点击直接填充示例："
         )
 
     return interface
@@ -1097,35 +1130,35 @@ def convert_to_16_bit_wav(data):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="VibeVoice Gradio Demo")
+    parser = argparse.ArgumentParser(description="VibeVoice Gradio 演示")
     parser.add_argument(
         "--model_path",
         type=str,
         default="/tmp/vibevoice-model",
-        help="Path to the VibeVoice model directory",
+        help="VibeVoice 模型目录路径",
     )
     parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device for inference",
+        help="推理设备（如 cuda、cuda:0 或 cpu）",
     )
     parser.add_argument(
         "--inference_steps",
         type=int,
         default=10,
-        help="Number of inference steps for DDPM (not exposed to users)",
+        help="DDPM 推理步数（不对外暴露的内部参数）",
     )
     parser.add_argument(
         "--share",
         action="store_true",
-        help="Share the demo publicly via Gradio",
+        help="通过 Gradio 创建可共享链接",
     )
     parser.add_argument(
         "--port",
         type=int,
         default=7860,
-        help="Port to run the demo on",
+        help="Demo 服务端口",
     )
     
     return parser.parse_args()
@@ -1137,7 +1170,7 @@ def main():
     
     set_seed(42)  # Set a fixed seed for reproducibility
 
-    print("🎙️ Initializing VibeVoice Demo with Streaming Support...")
+    print("🎙️ 正在初始化带流式播放的 VibeVoice 演示...")
     
     # Initialize demo instance
     demo_instance = VibeVoiceDemo(
@@ -1149,11 +1182,11 @@ def main():
     # Create interface
     interface = create_demo_interface(demo_instance)
     
-    print(f"🚀 Launching demo on port {args.port}")
-    print(f"📁 Model path: {args.model_path}")
-    print(f"🎭 Available voices: {len(demo_instance.available_voices)}")
-    print(f"🔴 Streaming mode: ENABLED")
-    print(f"🔒 Session isolation: ENABLED")
+    print(f"🚀 即将启动 Demo，端口 {args.port}")
+    print(f"📁 模型路径：{args.model_path}")
+    print(f"🎭 可用音色数量：{len(demo_instance.available_voices)}")
+    print("🔴 流式模式：已启用")
+    print("🔒 会话隔离：已启用")
     
     # Launch the interface
     try:
@@ -1168,9 +1201,9 @@ def main():
             show_api=False  # Hide API docs for cleaner interface
         )
     except KeyboardInterrupt:
-        print("\n🛑 Shutting down gracefully...")
+        print("\n🛑 收到中断信号，正在优雅退出...")
     except Exception as e:
-        print(f"❌ Server error: {e}")
+        print(f"❌ 服务启动失败：{e}")
         raise
 
 
